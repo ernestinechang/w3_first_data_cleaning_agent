@@ -1,0 +1,8 @@
+[theme]
+base = "light"
+primaryColor = "#FF9900"            # Amazon orange
+backgroundColor = "#EAEDED"         # Amazon light grey page background
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#0F1111"               # Amazon near-black text
+linkColor = "#007185"               # Amazon teal link
+font = "sans serif"

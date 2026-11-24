@@ -33,19 +33,43 @@ def get_dataframe_summary(df: pd.DataFrame) -> str:
     str
         A text summary of the DataFrame.
     """
-    missing_stats = (df.isna().sum() / len(df) * 100).sort_values(ascending=False)
+    n_rows = max(len(df), 1)
+    missing_stats = (df.isna().sum() / n_rows * 100).sort_values(ascending=False)
     missing_summary = "\n".join([f"{col}: {val:.2f}%" for col, val in missing_stats.items()])
-    
+
     column_types = "\n".join([f"{col}: {dtype}" for col, dtype in df.dtypes.items()])
-    
+
+    # Per-column detail: unique count and a few example values, so the LLM can
+    # spot placeholder strings, mixed formats, spelling variants, etc.
+    column_details = []
+    for col in df.columns:
+        examples = df[col].dropna().astype(str).unique()[:5].tolist()
+        column_details.append(f"{col}: {df[col].nunique()} unique; examples: {examples}")
+    column_details = "\n".join(column_details)
+
+    numeric_cols = df.select_dtypes(include="number")
+    numeric_stats = (
+        numeric_cols.describe().T[["min", "mean", "max"]].round(2).to_string()
+        if not numeric_cols.empty else "No numeric columns"
+    )
+
     summary = f"""
         Dataset Summary:
         ----------------
+        Shape: {df.shape[0]} rows x {df.shape[1]} columns
+        Duplicate rows: {int(df.duplicated().sum())}
+
         Column Data Types:
         {column_types}
 
         Missing Value Percentage:
-        {missing_summary}"""
+        {missing_summary}
+
+        Column Details:
+        {column_details}
+
+        Numeric Column Ranges:
+        {numeric_stats}"""
 
     return summary.strip()
 
@@ -80,21 +104,22 @@ def execute_agent_code(state, data_key, code_snippet_key, result_key, error_key,
     agent_code = state.get(code_snippet_key)
     df = pd.DataFrame.from_dict(data)
     
-    # Execute the LLM-generated code in isolated namespace
-    # Note: exec() can be risky - only use with trusted LLM-generated code
-    local_vars = {}
-    global_vars = {}
-    exec(agent_code, global_vars, local_vars)
-    
-    # Get the function from executed code
-    agent_function = local_vars.get(agent_function_name)
-    if not agent_function or not callable(agent_function):
-        raise ValueError(f"Function '{agent_function_name}' not found in generated code.")
-    
-    # Run the function and handle errors
+    # Run the generated code and handle errors. Everything (including exec and
+    # the function lookup) is inside the try so failures reach the retry loop.
     agent_error = None
     result = None
     try:
+        # Execute the LLM-generated code in isolated namespace
+        # Note: exec() can be risky - only use with trusted LLM-generated code
+        local_vars = {}
+        global_vars = {}
+        exec(agent_code, global_vars, local_vars)
+
+        # Get the function from executed code
+        agent_function = local_vars.get(agent_function_name)
+        if not agent_function or not callable(agent_function):
+            raise ValueError(f"Function '{agent_function_name}' not found in generated code.")
+
         result = agent_function(df)
         if isinstance(result, pd.DataFrame):
             result = result.to_dict()

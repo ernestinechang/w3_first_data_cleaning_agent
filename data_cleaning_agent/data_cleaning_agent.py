@@ -1,9 +1,10 @@
 # Libraries
-from typing import TypedDict
+from typing import TypedDict, List
 import os
 import logging
 
 import pandas as pd
+from pydantic import BaseModel, Field
 
 from langchain.prompts import PromptTemplate
 from langgraph.types import Checkpointer
@@ -20,6 +21,32 @@ from .utils import (
 logger = logging.getLogger(__name__)
 AGENT_NAME = "lightweight_data_cleaning_agent"
 LOG_PATH = os.path.join(os.getcwd(), "logs/")
+
+# Single source of truth for the cleaning steps. Used by the planning node,
+# the code-generation prompt and (via the plan) the Streamlit UI.
+CLEANING_STEPS = [
+    "Remove columns with more than 40% missing values",
+    "Impute missing values (mean for numeric, mode for categorical)",
+    "Remove duplicate rows",
+    "Round numeric columns to the most appropriate decimal places",
+    "Correct data types for each column",
+    "Correct obvious data entry errors (e.g., negative ages, impossible dates)",
+    "Rename columns to be more descriptive and consistent",
+    "Detect and handle outliers in numeric columns (cap using the IQR rule)",
+    "Clean text columns (trim whitespace, normalize case, merge spelling variants)",
+]
+
+
+class StepDecision(BaseModel):
+    """The planner's decision for one cleaning step."""
+    step: str = Field(description="The cleaning step, copied exactly from the list")
+    apply: bool = Field(description="True if this step should be performed on this dataset")
+    reason: str = Field(description="One or two sentences citing evidence from the dataset summary")
+
+
+class CleaningPlan(BaseModel):
+    """Decisions for every cleaning step."""
+    decisions: List[StepDecision]
 
 
 class LightweightDataCleaningAgent:
@@ -130,6 +157,21 @@ class LightweightDataCleaningAgent:
         if self.response:
             return self.response.get("data_cleaner_function")
 
+    def get_cleaning_plan(self):
+        """
+        Retrieves the planner's decisions as a list of
+        {"step": str, "apply": bool, "reason": str} dicts.
+        """
+        if self.response:
+            return self.response.get("cleaning_plan")
+
+    def get_error(self):
+        """
+        Retrieves the last execution error, or None if cleaning succeeded.
+        """
+        if self.response:
+            return self.response.get("data_cleaner_error")
+
 
 # Agent Factory Function
 
@@ -185,8 +227,47 @@ def make_lightweight_data_cleaning_agent(
         data_cleaner_error: str
         max_retries: int
         retry_count: int
+        cleaning_plan: list
 
-    
+    def create_cleaning_plan(state: GraphState):
+        """
+        Decide which cleaning steps this dataset needs, and why.
+        """
+        logger.info("Creating cleaning plan")
+
+        df = pd.DataFrame.from_dict(state.get("data_raw"))
+        dataset_summary = get_dataframe_summary(df)
+
+        planning_prompt = PromptTemplate(
+            template="""
+            You are a Data Cleaning Agent. Decide which cleaning steps this dataset needs.
+            For EACH step in the list below, say whether to apply it and why.
+            Base every reason on evidence in the dataset summary. If the summary has
+            no evidence either way, say so instead of guessing.
+            If the user instructions require or forbid a step, follow them.
+
+            Steps:
+            {steps}
+
+            User Instructions:
+            {user_instructions}
+
+            Dataset Summary:
+            {dataset_summary}
+            """,
+            input_variables=["steps", "user_instructions", "dataset_summary"],
+        )
+
+        planner = planning_prompt | model.with_structured_output(CleaningPlan)
+        plan = planner.invoke({
+            "steps": "\n".join(f"- {s}" for s in CLEANING_STEPS),
+            "user_instructions": state.get("user_instructions") or "None",
+            "dataset_summary": dataset_summary,
+        })
+
+        # Plain dicts keep the state serializable (checkpointer-friendly)
+        return {"cleaning_plan": [d.model_dump() for d in plan.decisions]}
+
     def create_data_cleaner_code(state: GraphState):
         """
         Generate the data cleaning code based on user instructions.
@@ -197,16 +278,25 @@ def make_lightweight_data_cleaning_agent(
         df = pd.DataFrame.from_dict(data_raw)
 
         dataset_summary = get_dataframe_summary(df)
-        
-        # TODO: Expand this prompt with more detailed cleaning instructions
+
+        # Steps come from the planner; fall back to all steps if there is no plan
+        plan = state.get("cleaning_plan") or [
+            {"step": s, "apply": True, "reason": ""} for s in CLEANING_STEPS
+        ]
+        steps_to_apply = "\n".join(
+            f"{i}. {d['step']}" for i, d in enumerate((d for d in plan if d["apply"]), 1)
+        ) or "None"
+        steps_to_skip = "\n".join(f"- {d['step']}" for d in plan if not d["apply"]) or "None"
+
         data_cleaning_prompt = PromptTemplate(
             template="""
             You are a Data Cleaning Agent. Create a {function_name}() function to clean the data.
 
-            Basic Cleaning Steps to implement:
-            1. Remove columns with more than 40% missing values
-            2. Impute missing values (mean for numeric, mode for categorical)
-            3. Remove duplicate rows
+            Cleaning steps to implement (in this order):
+            {steps_to_apply}
+
+            Do NOT perform these steps:
+            {steps_to_skip}
 
             User Instructions:
             {user_instructions}
@@ -224,7 +314,10 @@ def make_lightweight_data_cleaning_agent(
 
             Important: Ensure fit_transform() outputs are flattened with .ravel() when assigning to DataFrame columns.
             """,
-            input_variables=["user_instructions", "all_datasets_summary", "function_name"]
+            input_variables=[
+                "user_instructions", "all_datasets_summary", "function_name",
+                "steps_to_apply", "steps_to_skip",
+            ]
         )
 
         data_cleaning_agent = data_cleaning_prompt | model | PythonOutputParser()
@@ -232,7 +325,9 @@ def make_lightweight_data_cleaning_agent(
         response = data_cleaning_agent.invoke({
             "user_instructions": state.get("user_instructions") or "Follow the basic cleaning steps.",
             "all_datasets_summary": dataset_summary,
-            "function_name": function_name
+            "function_name": function_name,
+            "steps_to_apply": steps_to_apply,
+            "steps_to_skip": steps_to_skip,
         })
         
         # Simple logging if enabled
@@ -291,14 +386,16 @@ def make_lightweight_data_cleaning_agent(
     workflow = StateGraph(GraphState)
     
     # Add nodes
+    workflow.add_node("create_cleaning_plan", create_cleaning_plan)
     workflow.add_node("create_data_cleaner_code", create_data_cleaner_code)
     workflow.add_node("execute_data_cleaner_code", execute_data_cleaner_code)
     workflow.add_node("fix_data_cleaner_code", fix_data_cleaner_code)
     
     # Set entry point
-    workflow.set_entry_point("create_data_cleaner_code")
-    
+    workflow.set_entry_point("create_cleaning_plan")
+
     # Add edges
+    workflow.add_edge("create_cleaning_plan", "create_data_cleaner_code")
     workflow.add_edge("create_data_cleaner_code", "execute_data_cleaner_code")
     workflow.add_edge("fix_data_cleaner_code", "execute_data_cleaner_code")
     
