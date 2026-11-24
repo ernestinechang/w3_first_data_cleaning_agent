@@ -24,7 +24,7 @@ st.markdown(
     header[data-testid="stHeader"] {background: transparent;}
     footer, #MainMenu, [data-testid="stToolbar"], .stAppDeployButton {display: none !important;}
     h1, h2, h3, h4 {font-family: 'Inter', -apple-system, 'Segoe UI', sans-serif !important;}
-    .block-container {max-width: 1280px; padding-top: 2rem; padding-bottom: 4rem;}
+    .block-container {max-width: 100%; padding: 2rem 3rem 4rem;}
 
     /* Masthead: text only */
     .masthead {margin-bottom: 1.5rem;}
