@@ -22,31 +22,130 @@ logger = logging.getLogger(__name__)
 AGENT_NAME = "lightweight_data_cleaning_agent"
 LOG_PATH = os.path.join(os.getcwd(), "logs/")
 
-# Single source of truth for the cleaning steps. Used by the planning node,
-# the code-generation prompt and (via the plan) the Streamlit UI.
-CLEANING_STEPS = [
+# Single source of truth for the cleaning steps. Used by the planner, the
+# code-generation prompt and (via the plan) the Streamlit UI.
+# Dataset-level steps act on the table as a whole.
+DATASET_STEPS = [
     "Remove columns with more than 40% missing values",
-    "Impute missing values (mean for numeric, mode for categorical)",
     "Remove duplicate rows",
-    "Round numeric columns to the most appropriate decimal places",
-    "Correct data types for each column",
-    "Correct obvious data entry errors (e.g., negative ages, impossible dates)",
     "Rename columns to be more descriptive and consistent",
-    "Detect and handle outliers in numeric columns (cap using the IQR rule)",
-    "Clean text columns (trim whitespace, normalize case, merge spelling variants)",
 ]
+# Column-level steps are suggested and approved one column at a time.
+COLUMN_STEPS = [
+    "Impute missing values (mean for numeric, mode for categorical)",
+    "Round to the most appropriate decimal places",
+    "Correct the data type",
+    "Correct obvious data entry errors (e.g., negative ages, impossible dates)",
+    "Handle outliers (cap using the IQR rule)",
+    "Clean text (trim whitespace, normalize case, merge spelling variants)",
+]
+CLEANING_STEPS = DATASET_STEPS + COLUMN_STEPS
 
 
 class StepDecision(BaseModel):
     """The planner's decision for one cleaning step."""
     step: str = Field(description="The cleaning step, copied exactly from the list")
-    apply: bool = Field(description="True if this step should be performed on this dataset")
+    apply: bool = Field(description="True if this step should be performed")
     reason: str = Field(description="One or two sentences citing evidence from the dataset summary")
 
 
-class CleaningPlan(BaseModel):
-    """Decisions for every cleaning step."""
+class DatasetPlan(BaseModel):
+    """Decisions for every dataset-level step."""
     decisions: List[StepDecision]
+
+
+class ColumnDecisions(BaseModel):
+    """Decisions for every column-level step on one column."""
+    column: str = Field(description="The column name, copied exactly from the list")
+    decisions: List[StepDecision]
+
+
+class ColumnPlan(BaseModel):
+    """Decisions for every column-level step on each requested column."""
+    columns: List[ColumnDecisions]
+
+
+_PLAN_PROMPT = """
+You are a Data Cleaning Agent. {task}
+
+Base every reason on evidence in the dataset summary. If the summary has no
+evidence either way, say so instead of guessing. Copy step and column names
+exactly. If the user instructions require or forbid a step, follow them.
+
+Steps:
+{steps}
+{columns_block}
+User Instructions:
+{user_instructions}
+
+Dataset Summary:
+{dataset_summary}
+"""
+
+
+def _run_planner(model, schema, df, user_instructions, task, steps, columns=None):
+    prompt = PromptTemplate(
+        template=_PLAN_PROMPT,
+        input_variables=["task", "steps", "columns_block", "user_instructions", "dataset_summary"],
+    )
+    columns_block = (
+        "\nColumns:\n" + "\n".join(f"- {c}" for c in columns) + "\n" if columns else ""
+    )
+    return (prompt | model.with_structured_output(schema)).invoke({
+        "task": task,
+        "steps": "\n".join(f"- {s}" for s in steps),
+        "columns_block": columns_block,
+        "user_instructions": user_instructions or "None",
+        "dataset_summary": get_dataframe_summary(df),
+    })
+
+
+def suggest_cleaning_plan(
+    model, df: pd.DataFrame, user_instructions: str = None, scope: str = "all", columns=None
+) -> list:
+    """
+    Ask the LLM which cleaning steps are needed, and why. Nothing is changed in the data.
+
+    scope: "dataset" (whole-dataset steps only), "columns" (column-level steps for
+    `columns`, default every column), or "all" (both).
+
+    Returns a flat list of {"column": str | None, "step": str, "apply": bool,
+    "reason": str} dicts. "column" is None for dataset-level steps. Every step is
+    present for every requested column (anything the LLM skipped is marked not
+    applied), so the UI can show a complete, editable checklist.
+    """
+    def row(column, step, d):
+        return {
+            "column": column,
+            "step": step,
+            "apply": d.apply if d else False,
+            "reason": d.reason if d else "Not assessed by the agent.",
+        }
+
+    plan = []
+    if scope in ("dataset", "all"):
+        result = _run_planner(
+            model, DatasetPlan, df, user_instructions,
+            "For EACH dataset-level step below, say whether to apply it to this dataset and why.",
+            DATASET_STEPS,
+        )
+        found = {d.step: d for d in result.decisions}
+        plan += [row(None, s, found.get(s)) for s in DATASET_STEPS]
+
+    if scope in ("columns", "all"):
+        cols = [str(c) for c in (columns if columns is not None else df.columns)]
+        result = _run_planner(
+            model, ColumnPlan, df, user_instructions,
+            "For EACH column listed, and for EACH column-level step below, say whether to "
+            "apply the step to that column and why. Only apply a step to a column where the "
+            "summary shows evidence it is needed (e.g. do not impute a column with no missing "
+            "values; do not clean text on numeric columns).",
+            COLUMN_STEPS, columns=cols,
+        )
+        found = {c.column: {d.step: d for d in c.decisions} for c in result.columns}
+        for col in cols:
+            plan += [row(col, s, found.get(col, {}).get(s)) for s in COLUMN_STEPS]
+    return plan
 
 
 class LightweightDataCleaningAgent:
@@ -103,7 +202,20 @@ class LightweightDataCleaningAgent:
             checkpointer=checkpointer
         )
     
-    def invoke_agent(self, data_raw: pd.DataFrame, user_instructions: str=None, max_retries:int=3, retry_count:int=0, **kwargs):
+    def suggest_plan(self, data_raw: pd.DataFrame, user_instructions: str = None,
+                     scope: str = "all", columns=None) -> list:
+        """
+        Suggest cleaning steps without touching the data.
+
+        scope is "dataset", "columns" or "all"; `columns` limits a "columns" run
+        to specific column names.
+
+        Returns a list of {"step", "apply", "reason"} dicts. Review or edit it,
+        then pass it to invoke_agent(cleaning_plan=...) to run exactly those steps.
+        """
+        return suggest_cleaning_plan(self.model, data_raw, user_instructions, scope, columns)
+
+    def invoke_agent(self, data_raw: pd.DataFrame, user_instructions: str=None, max_retries:int=3, retry_count:int=0, cleaning_plan: list=None, **kwargs):
         """
         Generate and execute data cleaning code on the provided DataFrame.
         
@@ -127,12 +239,16 @@ class LightweightDataCleaningAgent:
         None
             Results are stored in self.response and accessed via getter methods.
         """
-        response = self._compiled_graph.invoke({
+        state = {
             "user_instructions": user_instructions,
             "data_raw": data_raw.to_dict(),
             "max_retries": max_retries,
             "retry_count": retry_count,
-        }, **kwargs)
+        }
+        if cleaning_plan:
+            # User-approved plan: the agent runs exactly these steps, no re-planning
+            state["cleaning_plan"] = cleaning_plan
+        response = self._compiled_graph.invoke(state, **kwargs)
         self.response = response  # Store full workflow response for getter methods
         return None
     
@@ -231,42 +347,16 @@ def make_lightweight_data_cleaning_agent(
 
     def create_cleaning_plan(state: GraphState):
         """
-        Decide which cleaning steps this dataset needs, and why.
+        Suggest which cleaning steps this dataset needs, and why.
+        Only runs when the caller did not supply an approved plan.
         """
         logger.info("Creating cleaning plan")
-
         df = pd.DataFrame.from_dict(state.get("data_raw"))
-        dataset_summary = get_dataframe_summary(df)
+        return {"cleaning_plan": suggest_cleaning_plan(model, df, state.get("user_instructions"))}
 
-        planning_prompt = PromptTemplate(
-            template="""
-            You are a Data Cleaning Agent. Decide which cleaning steps this dataset needs.
-            For EACH step in the list below, say whether to apply it and why.
-            Base every reason on evidence in the dataset summary. If the summary has
-            no evidence either way, say so instead of guessing.
-            If the user instructions require or forbid a step, follow them.
-
-            Steps:
-            {steps}
-
-            User Instructions:
-            {user_instructions}
-
-            Dataset Summary:
-            {dataset_summary}
-            """,
-            input_variables=["steps", "user_instructions", "dataset_summary"],
-        )
-
-        planner = planning_prompt | model.with_structured_output(CleaningPlan)
-        plan = planner.invoke({
-            "steps": "\n".join(f"- {s}" for s in CLEANING_STEPS),
-            "user_instructions": state.get("user_instructions") or "None",
-            "dataset_summary": dataset_summary,
-        })
-
-        # Plain dicts keep the state serializable (checkpointer-friendly)
-        return {"cleaning_plan": [d.model_dump() for d in plan.decisions]}
+    def route_start(state: GraphState):
+        # A user-approved plan skips the planner entirely
+        return "use_plan" if state.get("cleaning_plan") else "make_plan"
 
     def create_data_cleaner_code(state: GraphState):
         """
@@ -283,10 +373,16 @@ def make_lightweight_data_cleaning_agent(
         plan = state.get("cleaning_plan") or [
             {"step": s, "apply": True, "reason": ""} for s in CLEANING_STEPS
         ]
+        def label(d):
+            col = d.get("column")
+            return f"[Column '{col}'] {d['step']}" if col else f"[Whole dataset] {d['step']}"
+
         steps_to_apply = "\n".join(
-            f"{i}. {d['step']}" for i, d in enumerate((d for d in plan if d["apply"]), 1)
+            f"{i}. {label(d)}" for i, d in enumerate((d for d in plan if d["apply"]), 1)
         ) or "None"
-        steps_to_skip = "\n".join(f"- {d['step']}" for d in plan if not d["apply"]) or "None"
+        steps_to_skip = "\n".join(
+            f"- {label(d)}" for d in plan if not d["apply"] and not d.get("column")
+        ) or "None"
 
         data_cleaning_prompt = PromptTemplate(
             template="""
@@ -295,7 +391,9 @@ def make_lightweight_data_cleaning_agent(
             Cleaning steps to implement (in this order):
             {steps_to_apply}
 
-            Do NOT perform these steps:
+            Perform ONLY the steps listed above. A step marked [Column 'x'] must
+            touch only that column. Refer to columns by their ORIGINAL names, and do
+            any column renaming last. Do NOT perform these dataset-level steps:
             {steps_to_skip}
 
             User Instructions:
@@ -392,7 +490,10 @@ def make_lightweight_data_cleaning_agent(
     workflow.add_node("fix_data_cleaner_code", fix_data_cleaner_code)
     
     # Set entry point
-    workflow.set_entry_point("create_cleaning_plan")
+    workflow.set_conditional_entry_point(
+        route_start,
+        {"make_plan": "create_cleaning_plan", "use_plan": "create_data_cleaner_code"},
+    )
 
     # Add edges
     workflow.add_edge("create_cleaning_plan", "create_data_cleaner_code")
