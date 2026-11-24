@@ -162,6 +162,28 @@ Calling `invoke_agent(data_raw=df)` without a `cleaning_plan` makes the agent pl
 
 ## Deployment
 
+### Docker
+
+The repo includes a `Dockerfile` (Python 3.11, dependencies installed from `poetry.lock`, runs as a non-root user).
+
+1. **Build the image**:
+   ```bash
+   docker build -t data-cleaning-agent .
+   ```
+2. **Run it**, passing your API key at run time (it is never baked into the image):
+   ```bash
+   docker run --rm -p 8501:8501 -e OPENAI_API_KEY=sk-your-key-here data-cleaning-agent
+   ```
+   Or read it from your `.env` file:
+   ```bash
+   docker run --rm -p 8501:8501 --env-file .env data-cleaning-agent
+   ```
+3. Open http://localhost:8501.
+
+`.dockerignore` keeps `.env`, `.git` and `logs/` out of the image. To keep the generated cleaning code between runs, mount the logs folder: add `-v "$(pwd)/logs:/app/logs"` to the `docker run` command (on Linux, make that folder writable by UID 1000 or run the container with `--user "$(id -u):$(id -g)"`).
+
+The same image can be deployed to any container host (Render, Fly.io, AWS, etc.): set `OPENAI_API_KEY` as an environment variable and route traffic to port 8501.
+
 ### Streamlit Community Cloud (free)
 
 1. Push this repo to GitHub.
@@ -208,6 +230,8 @@ data-cleaning-agent/
 │   ├── data_cleaning_agent.py  # Agent: planning, code generation, execution, retries
 │   └── utils.py                # Dataset profiling and code execution helpers
 ├── app.py                      # Streamlit interface
+├── Dockerfile                  # Container image
+├── .dockerignore               # Files excluded from the image
 ├── pyproject.toml
 ├── poetry.lock                 # Committed for reproducible installs
 └── README.md
